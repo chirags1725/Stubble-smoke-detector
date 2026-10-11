@@ -1,0 +1,22 @@
+# Secrets and deployment parameters
+.env
+.env.*
+!.env.example
+samconfig.toml
+.aws-sam/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Frontend
+web/node_modules/
+web/dist/
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,310 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Stubble Smoke PM2.5 forecast, NASA FIRMS fire map, Bedrock insights and scheduled LightGBM forecaster
+
+Parameters:
+  FirmsKey:
+    Type: String
+    NoEcho: true
+    Description: NASA FIRMS API key used by the forecast worker. Do not save it in samconfig.toml.
+  SnsTopicArn:
+    Type: String
+    Default: arn:aws:sns:ap-southeast-2:704660346960:stubble
+    Description: Existing standard SNS topic with a confirmed email subscription.
+  AlertThresholdPM25:
+    Type: Number
+    Default: 150
+    MinValue: 1
+    MaxValue: 1000
+    Description: Alert when either 24-hour or 48-hour q90 reaches this PM2.5 value in µg/m³.
+  BedrockModelId:
+    Type: String
+    Default: amazon.nova-micro-v1:0
+    Description: Bedrock text model used only when a user requests an AI summary. Invocation is pay-per-use.
+  EnableBedrockSummary:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Grant the summary Lambda access to the selected Bedrock model; set false if the student account blocks Bedrock.
+  AllowedOrigin:
+    Type: String
+    Default: '*'
+    Description: CORS origin for the dashboard. Replace * with your deployed frontend origin for production.
+  EnableHourlySchedule:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create an EventBridge Scheduler trigger for one forecast per hour.
+
+Conditions:
+  UseHourlySchedule: !Equals [!Ref EnableHourlySchedule, 'true']
+  UseBedrockSummary: !Equals [!Ref EnableBedrockSummary, 'true']
+
+Resources:
+  ForecastHttpApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: !Sub "'${AllowedOrigin}'"
+        MaxAge: "'600'"
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingBurstLimit: 5
+          ThrottlingRateLimit: 2
+
+  ForecastTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-forecasts'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: N
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      SSESpecification:
+        SSEEnabled: true
+
+  ForecastApi:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/
+      Handler: app.handler
+      Runtime: python3.12
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE: !Ref ForecastTable
+          CITY: DEL
+          SNS_TOPIC_ARN: !Ref SnsTopicArn
+          ALERT_THRESHOLD_PM25: !Ref AlertThresholdPM25
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ForecastTable
+      Events:
+        LatestForecast:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ForecastHttpApi
+            Path: /latest
+            Method: get
+
+  HistoryApi:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/
+      Handler: history.handler
+      Runtime: python3.12
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE: !Ref ForecastTable
+          CITY: DEL
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ForecastTable
+      Events:
+        ForecastHistory:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ForecastHttpApi
+            Path: /history
+            Method: get
+
+  FireMapApi:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/
+      Handler: fires.handler
+      Runtime: python3.12
+      Timeout: 35
+      MemorySize: 512
+      Environment:
+        Variables:
+          FIRMS_KEY: !Ref FirmsKey
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Events:
+        FireDetections:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ForecastHttpApi
+            Path: /fires
+            Method: get
+
+  InsightsApi:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/
+      Handler: summary.handler
+      Runtime: python3.12
+      Timeout: 25
+      MemorySize: 512
+      Environment:
+        Variables:
+          TABLE: !Ref ForecastTable
+          CITY: DEL
+          ALERT_THRESHOLD_PM25: !Ref AlertThresholdPM25
+          BEDROCK_MODEL_ID: !If [UseBedrockSummary, !Ref BedrockModelId, '']
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Role: !GetAtt InsightsLambdaRole.Arn
+      Events:
+        DataSummary:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ForecastHttpApi
+            Path: /summary
+            Method: post
+
+  InsightsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: ReadForecastHistory
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource: !GetAtt ForecastTable.Arn
+
+  BedrockSummaryAccessPolicy:
+    Type: AWS::IAM::Policy
+    Condition: UseBedrockSummary
+    Properties:
+      PolicyName: InvokeSelectedSummaryModel
+      Roles:
+        - !Ref InsightsLambdaRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - bedrock:InvokeModel
+            Resource: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}'
+
+  RefreshForecastApi:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/api/
+      Handler: refresh.handler
+      Runtime: python3.12
+      Timeout: 120
+      Environment:
+        Variables:
+          FORECAST_FUNCTION_NAME: !Ref ForecastFunction
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ForecastFunction
+      Events:
+        RefreshForecast:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ForecastHttpApi
+            Path: /refresh
+            Method: post
+
+  ForecastFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: run_forecast.lambda_handler
+      Runtime: python3.12
+      Architectures: [x86_64]
+      Timeout: 300
+      MemorySize: 4096
+      ReservedConcurrentExecutions: 1
+      EphemeralStorage:
+        Size: 1024
+      Environment:
+        Variables:
+          TABLE: !Ref ForecastTable
+          CITY: DEL
+          FIRMS_KEY: !Ref FirmsKey
+          SNS_TOPIC_ARN: !Ref SnsTopicArn
+          SNS_REGION: ap-southeast-2
+          ALERT_THRESHOLD_PM25: !Ref AlertThresholdPM25
+          MODEL_DIR: /var/task/models
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ForecastTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref SnsTopicArn
+    Metadata:
+      BuildMethod: python3.12
+      BuildProperties:
+        RequirementsFile: requirements.txt
+
+  ForecastScheduleRole:
+    Type: AWS::IAM::Role
+    Condition: UseHourlySchedule
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeForecastWorker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ForecastFunction.Arn
+
+  ForecastHourlySchedule:
+    Type: AWS::Scheduler::Schedule
+    Condition: UseHourlySchedule
+    Properties:
+      Name: !Sub '${AWS::StackName}-hourly-forecast'
+      Description: Generate and evaluate a PM2.5 forecast once per hour.
+      State: ENABLED
+      ScheduleExpression: rate(1 hour)
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt ForecastFunction.Arn
+        RoleArn: !GetAtt ForecastScheduleRole.Arn
+        Input: '{"source":"hourly-schedule"}'
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 3600
+          MaximumRetryAttempts: 2
+
+Outputs:
+  ForecastApiUrl:
+    Description: API Gateway URL; routes include /latest, /history, /refresh, /fires and /summary.
+    Value: !Sub 'https://${ForecastHttpApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  ForecastTableName:
+    Description: DynamoDB table created by this stack.
+    Value: !Ref ForecastTable
+  ForecastFunctionName:
+    Description: Lambda function running the LightGBM model.
+    Value: !Ref ForecastFunction

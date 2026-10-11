@@ -1,0 +1,15 @@
+FROM public.ecr.aws/lambda/python:3.12
+
+# Install the native OpenMP runtime required by LightGBM.
+RUN dnf install -y libgomp && dnf clean all
+
+# Install Python dependencies.
+COPY src/requirements.txt ${LAMBDA_TASK_ROOT}/requirements.txt
+RUN pip install --no-cache-dir -r ${LAMBDA_TASK_ROOT}/requirements.txt
+
+# Copy application code and trained model files.
+COPY src/ ${LAMBDA_TASK_ROOT}/
+COPY models/ ${LAMBDA_TASK_ROOT}/models/
+
+# Lambda entry point for forecast generation.
+CMD ["run_forecast.lambda_handler"]
